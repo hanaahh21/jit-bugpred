@@ -35,3 +35,5 @@ Repo data/kafka_repo/
 Repo data/src/
 Repo data/src_temp/
 Repo Data
+
+.venv/
