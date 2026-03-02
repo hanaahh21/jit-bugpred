@@ -212,4 +212,3 @@ class JITGNN(nn.Module):
 
         output = self.fc(features)
         return output, agg
-

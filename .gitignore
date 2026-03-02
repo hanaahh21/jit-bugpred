@@ -27,7 +27,7 @@ logs
 repos
 data/**
 **/.DS_Store
-
+src/.env
 # Repo data - large files
 Repo data/*.csv
 Repo data/*.json

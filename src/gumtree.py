@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -151,6 +152,59 @@ class SubTreeExtractor:
 
 
 # =========================================================
+# Parallel Processing Helper
+# =========================================================
+
+def process_single_commit(args):
+    """Process a single commit - designed to be called in parallel"""
+    commit_hash, commit_data, types = args
+    
+    gumtree = GumTreeDiff()
+    commit_files = []
+    candidate_files = 0
+    success_files = 0
+    gumtree_failures = 0
+    
+    for file_tuple in commit_data["files"]:
+        filepath, before, after = file_tuple
+        
+        if not filepath.endswith(tuple(types)):
+            continue
+        candidate_files += 1
+        
+        try:
+            b_dot, a_dot = gumtree.get_dotfiles((filepath, before, after))
+        except (SyntaxError, Exception):
+            gumtree_failures += 1
+            continue
+        
+        try:
+            b_subtree = SubTreeExtractor(b_dot).extract_subtree()
+            a_subtree = SubTreeExtractor(a_dot).extract_subtree()
+            
+            if len(b_subtree[0]) == 0 and len(a_subtree[0]) == 0:
+                continue
+            
+            commit_files.append((filepath, b_subtree, a_subtree))
+            success_files += 1
+        except Exception as e:
+            gumtree_failures += 1
+            continue
+    
+    # Determine skip reason if no files succeeded
+    skip_reason = None
+    if success_files == 0:
+        if candidate_files == 0:
+            skip_reason = 'no_supported_files'
+        elif gumtree_failures > 0:
+            skip_reason = 'gumtree_failed_or_empty'
+        else:
+            skip_reason = 'empty_subtree'
+    
+    return commit_hash, commit_files, skip_reason
+
+
+# =========================================================
 # Dataset Processor
 # =========================================================
 
@@ -238,96 +292,82 @@ class ASTDatasetBuilder:
         }
         self._atomic_write_json(self.progress_file, progress, self.progress_backup_file)
 
-    def run(self):
+    def run(self, max_workers=4):
 
         # Load full dataset
         with open(self.dataset_file, 'r') as f:
             dataset = json.load(f)
 
-        # Load existing AST output if exists (resume mode)
+        # Start fresh - delete existing files
         if os.path.exists(self.output_file):
-            self.ast_dict = self._safe_load_json(self.output_file, fallback={}, backup_path=self.output_backup_file)
-            print(f"\nResuming from existing file. Already processed: {len(self.ast_dict)} commits\n")
-        else:
-            self.ast_dict = {}
-            print("\nStarting fresh AST generation\n")
-
-        self.load_progress()
-        self.processed_commits.update(self.ast_dict.keys())
-        already_done = self.processed_commits
+            print(f"Deleting existing AST file: {self.output_file}")
+            os.remove(self.output_file)
+        if os.path.exists(self.output_backup_file):
+            os.remove(self.output_backup_file)
+        
+        self.ast_dict = {}
+        print("\nStarting fresh AST generation with parallel processing\n")
 
         total = len(dataset)
-        remaining_commits = [c for c in dataset.keys() if c not in already_done]
+        commits_to_process = list(dataset.keys())
 
         print(f"Total commits in dataset: {total}")
-        print(f"Already processed (including skipped): {len(already_done)}")
-        print(f"Remaining to process: {len(remaining_commits)}\n")
+        print(f"Workers: {max_workers}\n")
 
         start_time = time.time()
-        gumtree = GumTreeDiff()
-
         processed = 0
+        skipped = 0
 
-        for commit_hash in remaining_commits:
-            commit_data = dataset[commit_hash]
-            processed += 1
-            commit_start = time.time()
-            candidate_files = 0
-            success_files = 0
-            gumtree_failures = 0
+        # Prepare arguments for parallel processing
+        process_args = [
+            (commit_hash, dataset[commit_hash], self.types)
+            for commit_hash in commits_to_process
+        ]
 
-            for file_tuple in commit_data["files"]:
-                filepath, before, after = file_tuple
-
-                if not filepath.endswith(tuple(self.types)):
-                    continue
-                candidate_files += 1
-
+        # Process commits in parallel
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(process_single_commit, args): args[0]
+                for args in process_args
+            }
+            
+            for future in as_completed(futures):
+                commit_hash = futures[future]
+                processed += 1
+                
                 try:
-                    b_dot, a_dot = gumtree.get_dotfiles((filepath, before, after))
-                except SyntaxError:
-                    print("GumTree failed for:", filepath)
-                    gumtree_failures += 1
-                    continue
-
-                b_subtree = SubTreeExtractor(b_dot).extract_subtree()
-                a_subtree = SubTreeExtractor(a_dot).extract_subtree()
-
-                if len(b_subtree[0]) == 0 and len(a_subtree[0]) == 0:
-                    continue
-
-                self.ast_dict.setdefault(commit_hash, []).append(
-                    (filepath, b_subtree, a_subtree)
-                )
-                success_files += 1
-
-            self.processed_commits.add(commit_hash)
-
-            if success_files > 0:
-                if commit_hash in self.skipped_commits:
-                    del self.skipped_commits[commit_hash]
-                print(f"{commit_hash[:7]} processed in {self.time_since(commit_start)}")
-            else:
-                if candidate_files == 0:
-                    reason = 'no_supported_files'
-                elif gumtree_failures > 0:
-                    reason = 'gumtree_failed_or_empty'
-                else:
-                    reason = 'empty_subtree'
-                self.skipped_commits[commit_hash] = reason
-
-            # Save every 50 commits for safety
-            if processed % 50 == 0:
-                self._atomic_write_json(self.output_file, self.ast_dict, self.output_backup_file)
-                self.save_progress()
-                print(f"Checkpoint saved ({len(self.ast_dict)} commits)")
+                    commit_hash, commit_files, skip_reason = future.result()
+                    
+                    if skip_reason:
+                        self.skipped_commits[commit_hash] = skip_reason
+                        skipped += 1
+                    else:
+                        self.ast_dict[commit_hash] = commit_files
+                        print(f"[{processed}/{total}] {commit_hash[:7]} ✓ ({len(commit_files)} files)")
+                    
+                    self.processed_commits.add(commit_hash)
+                    
+                    # Save every 50 commits for safety
+                    if processed % 50 == 0:
+                        self._atomic_write_json(self.output_file, self.ast_dict, self.output_backup_file)
+                        self.save_progress()
+                        elapsed = self.time_since(start_time)
+                        rate = processed / (time.time() - start_time)
+                        eta = (total - processed) / rate if rate > 0 else 0
+                        eta_str = f"{int(eta//60)}m {int(eta%60)}s"
+                        print(f"Checkpoint: {len(self.ast_dict)} commits | Skipped: {skipped} | ETA: {eta_str}")
+                        
+                except Exception as e:
+                    print(f"[{processed}/{total}] {commit_hash[:7]} ✗ Error: {str(e)}")
+                    self.skipped_commits[commit_hash] = f'error: {str(e)}'
+                    self.processed_commits.add(commit_hash)
 
         # Final save
         self._atomic_write_json(self.output_file, self.ast_dict, self.output_backup_file)
         self.save_progress()
 
         print("\n==============================================")
-        print(f"Finished processing remaining commits")
+        print(f"Finished processing all commits")
         print(f"Total commits stored: {len(self.ast_dict)}")
         print(f"Total commits skipped: {len(self.skipped_commits)}")
         print(f"Total time: {self.time_since(start_time)}")
@@ -339,9 +379,14 @@ class ASTDatasetBuilder:
 # =========================================================
 
 if __name__ == "__main__":
+    import multiprocessing
+    max_workers = min(8, multiprocessing.cpu_count())  # Use up to 8 cores
+    
+    print(f"Starting AST extraction with {max_workers} parallel workers...\n")
+    
     builder = ASTDatasetBuilder(
         dataset_file=f"{REPO}_source_dataset.json",
         output_file=f"{REPO}_ast_subtrees.json",
         types=['.java']
     )
-    builder.run()
+    builder.run(max_workers=max_workers)

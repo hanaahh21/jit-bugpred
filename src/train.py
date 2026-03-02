@@ -3,8 +3,14 @@ import os
 import time
 import numpy as np
 import torch
-from imblearn.over_sampling import SMOTE
-from scipy.optimize import differential_evolution
+try:
+    from imblearn.over_sampling import SMOTE
+except ImportError:
+    SMOTE = None
+try:
+    from scipy.optimize import differential_evolution
+except ImportError:
+    differential_evolution = None
 from sklearn import metrics
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import roc_auc_score, precision_recall_curve
@@ -33,7 +39,12 @@ def evaluate(label, output):
     return roc_auc(np.array(label), np.array(output))
 
 
-def pretrain(model, optimizer, criterion, epochs, dataset, so_far=0, resume=None):
+def pretrain(model, optimizer, criterion, epochs, dataset, so_far=0, resume=None, output_dir=None):
+    if output_dir is None:
+        output_dir = data_path
+    model_dir = os.path.join(BASE_PATH, 'trained_models')
+    os.makedirs(model_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     if resume:
         all_training_aucs = resume['all_training_aucs']
         all_training_losses = resume['all_training_losses']
@@ -55,13 +66,15 @@ def pretrain(model, optimizer, criterion, epochs, dataset, so_far=0, resume=None
         total_loss = 0
         y_scores = []
         y_true = []
-        # features_list = []
-        # label_list = []
+        train_embeddings = []
+        train_commit_ids = []
+        train_labels = []
 
         model.train()
         dataset.set_mode('train')
         print('len(data) is {}'.format(str(len(dataset))))
         for i in range(len(dataset)):
+            commit_id = dataset.c_list[i]
             data = dataset[i]
             if data is None:
                 continue
@@ -72,8 +85,9 @@ def pretrain(model, optimizer, criterion, epochs, dataset, so_far=0, resume=None
                                      data[2].to(device), data[3].to(device),
                                      data[5].to(device))
 
-            # features_list.append(features)
-            # label_list.append(label)
+            train_embeddings.append(features.detach().cpu().numpy())
+            train_commit_ids.append(commit_id)
+            train_labels.append(label)
             loss = criterion(output, torch.Tensor([label]).to(device))
             loss.backward()
             optimizer.step()
@@ -92,7 +106,7 @@ def pretrain(model, optimizer, criterion, epochs, dataset, so_far=0, resume=None
             'epoch': e + 1 + so_far,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict()
-        }, os.path.join(BASE_PATH, 'trained_models/checkpoint.pt'))
+        }, os.path.join(model_dir, 'checkpoint.pt'))
         print('* checkpoint saved.')
 
         training_loss = total_loss / len(dataset)
@@ -135,13 +149,16 @@ def pretrain(model, optimizer, criterion, epochs, dataset, so_far=0, resume=None
         print('metrics: AUC={}\n'.format(val_auc))
 
         if len(all_val_aucs) == 0 or val_auc > max(all_val_aucs):
-            torch.save(model, os.path.join(BASE_PATH, 'trained_models/model_best_auc.pt'))
+            torch.save(model, os.path.join(model_dir, 'model_best_auc.pt'))
             print('* model_best_auc saved.')
-            # torch.save(torch.vstack(features_list), os.path.join(BASE_PATH, 'trained_models/train_features.pt'))
-            # torch.save(torch.Tensor(label_list), os.path.join(BASE_PATH, 'trained_models/train_labels.pt'))
-            # print('* features saved.')
+            if len(train_embeddings):
+                feat_df = pd.DataFrame(np.array(train_embeddings), columns=[f'feat_{i}' for i in range(len(train_embeddings[0]))])
+                feat_df.insert(0, 'label', train_labels)
+                feat_df.insert(0, 'commit_id', train_commit_ids)
+                feat_df.to_csv(os.path.join(output_dir, 'kafka_train_embeddings.csv'), index=False)
+                print('* kafka_train_embeddings.csv saved.')
         if len(all_val_losses) == 0 or val_loss < min(all_val_losses):
-            torch.save(model, os.path.join(BASE_PATH, 'trained_models/model_least_loss.pt'))
+            torch.save(model, os.path.join(model_dir, 'model_least_loss.pt'))
             print('* model_least_loss saved.')
 
         all_val_losses.append(val_loss)
@@ -152,15 +169,17 @@ def pretrain(model, optimizer, criterion, epochs, dataset, so_far=0, resume=None
             'all_training_aucs': all_training_aucs,
             'all_val_losses': all_val_losses,
             'all_val_aucs': all_val_aucs,
-        }, os.path.join(BASE_PATH, 'trained_models/stats.pt'))
+        }, os.path.join(model_dir, 'stats.pt'))
         print('* stats saved.\n')
 
-    torch.save(model, os.path.join(BASE_PATH, 'trained_models/model_final.pt'))
+    torch.save(model, os.path.join(model_dir, 'model_final.pt'))
     print('* model_final saved.')
     print('\ntraining finished')
 
 
 def objective_func(k, train_features, train_labels, valid_features, valid_labels):
+    if SMOTE is None:
+        raise ImportError('imblearn is required for SMOTE-based objective_func.')
     smote = SMOTE(random_state=42, k_neighbors=int(np.round(k)), n_jobs=32)
     train_feature_res, train_label_res = smote.fit_resample(train_features, train_labels)
     clf = RandomForestClassifier(n_estimators=300, random_state=42, n_jobs=-1)
@@ -172,6 +191,8 @@ def objective_func(k, train_features, train_labels, valid_features, valid_labels
 
 
 def train(clf, train_features, train_labels):
+    if SMOTE is None or differential_evolution is None:
+        raise ImportError('imblearn and scipy are required for train().')
     percent_80 = int(train_features.shape[0] * 0.8)
     train_features, valid_features = train_features[:percent_80], train_features[percent_80:]
     train_labels, valid_labels = train_labels[:percent_80], train_labels[percent_80:]
@@ -187,18 +208,21 @@ def train(clf, train_features, train_labels):
     print('metrics: AUC={}\n'.format(auc))
 
 
-def test(model, dataset, clf):
+def test(model, dataset, clf, output_dir=None):
+    if output_dir is None:
+        output_dir = data_path
     print('testing')
     y_scores = []
     y_true = []
-    # features_list = []
-    # label_list = []
+    commit_ids = []
+    embeddings = []
 
     model.eval()
     dataset.set_mode('test')
     print('len(data) is {}'.format(str(len(dataset))))
     with torch.no_grad():
         for i in range(len(dataset)):
+            commit_id = dataset.c_list[i]
             data = dataset[i]
             if data is None:
                 continue
@@ -207,12 +231,17 @@ def test(model, dataset, clf):
             output, features = model(data[0].to(device), data[1].to(device),
                                      data[2].to(device), data[3].to(device),
                                      data[5].to(device))
-            # features_list.append(features)
-            # label_list.append(label)
+            commit_ids.append(commit_id)
+            embeddings.append(features.detach().cpu().numpy())
             y_scores.append(torch.sigmoid(output).item())
             y_true.append(label)
 
-    pd.DataFrame({'y_true': y_true, 'y_score': y_scores}).to_csv(os.path.join(data_path, 'test_result.csv'))
+    pd.DataFrame({'commit_id': commit_ids, 'y_true': y_true, 'y_score': y_scores}).to_csv(
+        os.path.join(output_dir, 'kafka_test_predictions.csv'), index=False)
+    if len(embeddings):
+        emb_df = pd.DataFrame(np.array(embeddings), columns=[f'feat_{i}' for i in range(len(embeddings[0]))])
+        emb_df.insert(0, 'commit_id', commit_ids)
+        emb_df.to_csv(os.path.join(output_dir, 'kafka_test_embeddings.csv'), index=False)
     fpr, tpr, thresholds, auc = evaluate(y_true, y_scores)
     print('metrics: AUC={}\n\nthresholds={}\n'.format(auc, str(thresholds)))
     # features = torch.vstack(features_list).cpu().detach().numpy()
@@ -229,7 +258,7 @@ def test(model, dataset, clf):
     plt.ylim([0, 1])
     plt.ylabel('True Positive Rate')
     plt.xlabel('False Positive Rate')
-    plt.savefig(os.path.join(BASE_PATH, 'trained_models/roc.png'))
+    plt.savefig(os.path.join(output_dir, 'kafka_roc.png'))
 
     p, r, _ = precision_recall_curve(y_true, y_scores)
     plt.clf()
@@ -240,7 +269,7 @@ def test(model, dataset, clf):
     plt.ylim([0, 1])
     plt.ylabel('Precision')
     plt.xlabel('Recall')
-    plt.savefig(os.path.join(BASE_PATH, 'trained_models/pr.png'))
+    plt.savefig(os.path.join(output_dir, 'kafka_pr.png'))
 
     print('testing finished')
 
