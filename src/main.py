@@ -8,6 +8,8 @@ from train import pretrain, test, resume_training, plot_training, train
 import argparse
 
 BASE_PATH = os.path.dirname(os.path.dirname(__file__))
+DATA_DIR = os.path.join(BASE_PATH, 'Repo data')
+REPO = os.getenv('REPO_NAME', 'kafka')
 
 
 if __name__ == '__main__':
@@ -19,21 +21,30 @@ if __name__ == '__main__':
     batch_size = 1
     n_classes = 2
 
+    train_files = sorted([
+        f for f in os.listdir(DATA_DIR)
+        if f.startswith(f'{REPO}_train_') and f.endswith('.json')
+    ])
+
+    if not train_files:
+        raise FileNotFoundError(
+            f'No {REPO} train AST files found. Run: python src/splitter.py'
+        )
+
     data_dict = {
-        'train': ['/apache_train_50_all_1.json', '/apache_train_50_all_2.json',
-                  '/apache_train_50_all_3.json', '/apache_train_50_all_4.json'],
-        'val': ['/apache_valid_50_all.json'],
-        'test': ['/apache_test.json'],
-        'labels': '/apache_labels.json'
+        'train': train_files,
+        'val': [f'{REPO}_valid.json'],
+        'test': [f'{REPO}_test.json'],
+        'labels': f'{REPO}_labels.json'
     }
     commit_lists = {
-        'train': '/apache_train_50_all.csv',
-        'val': '/apache_valid_50_all.csv',
-        'test': '/apache_test.csv'
+        'train': f'{REPO}_train.csv',
+        'val': f'{REPO}_valid.csv',
+        'test': f'{REPO}_test.csv'
     }
-    metrics_file = 'apache_metrics_kamei.csv'
+    metrics_file = f'{REPO}_metrics_kamei.csv'
 
-    dataset = ASTDataset(data_dict, commit_lists, metrics_file=metrics_file, special_token=False)
+    dataset = ASTDataset(data_dict, commit_lists, metrics_file=metrics_file, special_token=False, data_dir=DATA_DIR)
     hidden_size = len(dataset.vectorizer_model.vocabulary_) + 2   # plus supernode node feature and node colors
     metric_size = dataset.metrics.shape[1] - 1      # exclude commit_id column
     print('hidden_size is {}'.format(hidden_size))

@@ -10,19 +10,20 @@ from sklearn.feature_extraction.text import CountVectorizer
 from torch.utils.data import Dataset
 
 BASE_PATH = os.path.dirname(os.path.dirname(__file__))
-data_path = os.path.join(BASE_PATH, 'data')
+data_path = os.path.join(BASE_PATH, 'Repo data')
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 HIDDEN_SIZE = 768
 
 
 class ASTDataset(Dataset):
-    def __init__(self, data_dict, commit_lists, metrics_file, special_token=True, transform=None):
+    def __init__(self, data_dict, commit_lists, metrics_file, special_token=True, transform=None, data_dir=None):
         self.transform = transform
         self.special_token = special_token
         self.data_dict = data_dict
         self.commit_lists = commit_lists
-        with open(data_path + self.data_dict['labels']) as file:
+        self.data_dir = data_dir if data_dir else data_path
+        with open(os.path.join(self.data_dir, self.data_dict['labels'])) as file:
             self.labels = json.load(file)
         self.ast_dict = None
         self.c_list = None
@@ -34,7 +35,7 @@ class ASTDataset(Dataset):
         self.learn_vectorizer()
 
     def load_metrics(self, metrics_file):
-        self.metrics = pd.read_csv(os.path.join(data_path, metrics_file))
+        self.metrics = pd.read_csv(os.path.join(self.data_dir, metrics_file))
         self.metrics = self.metrics.drop(
             ['author_date', 'bugcount', 'fixcount', 'revd', 'tcmt', 'oexp', 'orexp', 'osexp', 'osawr', 'project',
              'buggy', 'fix'],
@@ -47,7 +48,7 @@ class ASTDataset(Dataset):
         files = list(self.data_dict['train']) + list(self.data_dict['val'])
         corpus = []
         for fname in files:
-            with open(data_path + fname) as fp:
+            with open(os.path.join(self.data_dir, fname)) as fp:
                 subtrees = json.load(fp)
             for commit, files in subtrees.items():
                 for f in files:
@@ -86,15 +87,15 @@ class ASTDataset(Dataset):
 
     def set_mode(self, mode):
         self.mode = mode
-        self.c_list = pd.read_csv(data_path + self.commit_lists[self.mode])['commit_id'].tolist()
+        self.c_list = pd.read_csv(os.path.join(self.data_dir, self.commit_lists[self.mode]))['commit_id'].tolist()
         self.file_index = 0
-        with open(data_path + self.data_dict[self.mode][self.file_index], 'r') as fp:
+        with open(os.path.join(self.data_dir, self.data_dict[self.mode][self.file_index]), 'r') as fp:
             self.ast_dict = json.load(fp)
 
     def switch_datafile(self):
         self.file_index += 1
         self.file_index %= len(self.data_dict[self.mode])
-        with open(data_path + self.data_dict[self.mode][self.file_index], 'r') as fp:
+        with open(os.path.join(self.data_dir, self.data_dict[self.mode][self.file_index]), 'r') as fp:
             self.ast_dict = json.load(fp)
 
     @staticmethod

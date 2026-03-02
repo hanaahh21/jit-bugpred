@@ -1,149 +1,198 @@
+import os
 import json
 import time
 import pandas as pd
-import os
 import requests
-from pydriller import RepositoryMining, ModificationType
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BASE_PATH = os.path.dirname(os.path.dirname(__file__))
-data_path = os.path.join(BASE_PATH, 'data')
-MAX_N_CHANGED_FILES = 3
+REPO_DATA_PATH = os.path.join(BASE_PATH, "Repo Data")
+REPO = os.getenv("REPO_NAME", "kafka")
 
 
 class GitMiner:
-    def __init__(self):
-        self.base_url = 'https://api.github.com'
-        # self.max_n_files = max_n_changed_files
-        with open(os.path.join(BASE_PATH, 'conf', 'auth.conf'), 'r') as file:
-            lines = file.readlines()
-        self.token = lines[2].split('\n')[0]
+    def __init__(self, owner="apache", repo=REPO, max_workers=4):
+        self.base_url = "https://api.github.com"
+        self.owner = owner
+        self.repo = repo
+        self.max_workers = max_workers  # Parallel requests per commit
+
+        self.token = os.getenv("GITHUB_TOKEN")
+        if not self.token:
+            raise Exception("GITHUB_TOKEN environment variable not set")
+
         self.session = requests.Session()
+        # Connection pool for better parallelism
+        adapter = requests.adapters.HTTPAdapter(pool_connections=max_workers, pool_maxsize=max_workers)
+        self.session.mount("https://", adapter)
 
-    def get_before_after_content(self, commit_id):
-        try:
-            commit = self.search_commit(commit_id)
-        except IndexError:
+    def get_commit(self, commit_sha):
+        headers = {
+            "Authorization": f"token {self.token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+
+        url = f"{self.base_url}/repos/{self.owner}/{self.repo}/commits/{commit_sha}"
+        response = self.session.get(url, headers=headers)
+
+        if response.status_code != 200:
+            print(f"Commit not found: {commit_sha} (status {response.status_code})")
             return None
-        headers = {'Authorization': 'token ' + self.token,
-                   'content-type': 'application/json',
-                   'accept': 'application/vnd.github.v3+json'}
-        response = self.session.get(commit.get('url'), headers=headers)
-        commit = json.loads(response.text)
-        changed_files = commit.get('files')
-        # if len(changed_files) > self.max_n_files:
-        #     return None
-        filenames = [file.get('filename') for file in changed_files]
-        before_contents = []
-        after_contents = []
-        headers['accept'] = 'application/vnd.github.v3.raw'
-        for file in changed_files:
-            response = self.session.get(file.get('contents_url'), headers=headers)
-            after_contents.append(response.text)
-            response = self.session.get(file.get('contents_url') + '&ref=' + commit.get('parents')[0].get('sha'),
-                                        headers=headers)
-            before_contents.append(response.text)
 
-        return list(zip(filenames, before_contents, after_contents))
+        return response.json()
 
-    def search_commit(self, commit_id):
-        headers = {'Authorization': 'token ' + self.token,
-                   'content-type': 'application/json',
-                   'accept': 'application/vnd.github.cloak-preview'}
-        query = self.base_url + '/search/commits?q=' + commit_id + '+org:openstack'
-        response = self.session.get(query, headers=headers)
-        time.sleep(2)
-        response_dict = json.loads(response.text)
-        return response_dict.get('items')[0]
+    def get_before_after_content(self, commit_sha):
+        commit = self.get_commit(commit_sha)
+        if commit is None:
+            return None
 
+        changed_files = commit.get("files", [])
+        if not changed_files:
+            return None
 
-def get_source_codes():
-    df = pd.read_csv(data_path + '/alltrain.csv')
-    collected = pd.concat([pd.read_csv(data_path + '/ballowfiletrain.csv'),
-                           pd.read_csv(data_path + '/ballowfileval.csv'),
-                           pd.read_csv(data_path + '/ballowfiletest.csv')])
-    df = df[~df['commit_id'].isin(collected['commit_id'])]
-    # df_dict = df[['commit_id', 'buggy']].sample(frac=1).set_index('commit_id').to_dict()['buggy']
-    # df = df[df['buggy']][['commit_id', 'buggy']].sample(frac=1)     # SELECT commit_id, buggy WHERE buggy='TRUE';
+        # Filter to Java files only, and remove deleted files upfront
+        java_files = [
+            f for f in changed_files 
+            if f.get("status") != "removed" and f.get("filename", "").endswith(".java")
+        ]
+        
+        if not java_files:
+            return None
 
-    miner = GitMiner()
+        file_data = []
+        parent_sha = commit.get("parents", [{}])[0].get("sha")
 
-    contents = dict()
-    # buggy_cntr = {'True': 0, 'False': 0}
-    # ratio = 0.25
-    for i, row in df.iterrows():
-        cmtid = row['commit_id']
-        # if not buggy and buggy_cntr['True'] < buggy_cntr['False'] * ratio:
-        # continue
-        content = miner.get_before_after_content(cmtid)
-        if content is None:
-            print('\t\tcommit', cmtid, 'skipped!')
-            continue
-        contents[cmtid] = content
-        # buggy_cntr[str(buggy)] += 1
-        print('commit', cmtid, 'source codes fetched!')
+        def fetch_file_content(file):
+            """Fetch before/after content for a single file in parallel."""
+            filename = file.get("filename")
+            contents_url = file.get("contents_url")
 
-    with open(data_path + '/source_codes_' + 'alltrain' + '.json', 'w') as fp:
-        json.dump(contents, fp)
-    print('\nfinished.')
-    # print('buggy counter:', buggy_cntr)
+            raw_headers = {
+                "Authorization": f"token {self.token}",
+                "Accept": "application/vnd.github.v3.raw"
+            }
 
-
-def get_project_name(filename):
-    df = pd.read_csv(os.path.join(data_path, filename), dtype={'revd': str, 'buggy': str, 'fix': str})
-    miner = GitMiner()
-
-    projects = []
-    for i, row in df.iterrows():
-        cmtid = row['commit_id']
-        proj = None
-        while not proj:
+            # Fetch after content
             try:
-                response = miner.search_commit(cmtid)
-                proj = response['repository']['full_name']
-            except IndexError:
-                print('\t\t*****', cmtid)
-                proj = 'unkowncommit'
-            except TypeError:
-                time.sleep(30)
+                after_response = self.session.get(contents_url, headers=raw_headers, timeout=15)
+                after_content = after_response.text if after_response.status_code == 200 else ""
+            except:
+                after_content = ""
 
-        if i % 50 == 49:
-            print('a batch of 50 commits finished.')
-        projects.append(proj)
-        assert i == len(projects) - 1
+            # Fetch before content
+            before_content = ""
+            if parent_sha:
+                try:
+                    before_url = f"{contents_url}&ref={parent_sha}"
+                    before_response = self.session.get(before_url, headers=raw_headers, timeout=15)
+                    if before_response.status_code == 200:
+                        before_content = before_response.text
+                except:
+                    before_content = ""
 
-    df = df.assign(project=pd.Series(projects).values)
-    df.to_csv(os.path.join(data_path, 'new' + filename), index=False)
-    print('\nfinished.')
+            return [filename, before_content, after_content]
+
+        # Parallel fetch for all files in this commit
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {executor.submit(fetch_file_content, f): f for f in java_files}
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    file_data.append(result)
+                except Exception as e:
+                    print(f"Error fetching file content: {e}")
+
+        return file_data if file_data else None
 
 
-def update_n_files():
-    df = pd.read_csv(data_path + '/newrawdata.csv', dtype={'revd': str, 'buggy': str, 'fix': str})
-    projects = ['https://github.com/' + p + '.git' for p in df['project'].unique() if p != 'unkowncommit']
-    repo_mining = RepositoryMining(projects, only_commits=df['commit_id'].tolist())
-    nfs = dict()
-    for i, c in enumerate(repo_mining.traverse_commits()):
-        nf = 0
-        for m in c.modifications:
-            if m.filename.endswith('.py') and m.change_type is ModificationType.MODIFY:
-                nf += 1
-        nfs[c.hash] = nf
-        if i % 50 == 49:
-            print('a batch of 50 commits finished.')
+def build_dataset_from_pr_csv():
+    csv_path = os.path.join(REPO_DATA_PATH, "apache_pr_commits.csv")
 
-    nf_list = []
-    for i, row in df.iterrows():
-        if row['project'] == 'unkowncommit':
-            nf = row['nf']
-        else:
-            nf = nfs[row['commit_id']]
-        nf_list.append(nf)
+    if not os.path.exists(csv_path):
+        print("CSV file not found:", csv_path)
+        return
 
-    df['nf'] = nf_list
-    df.to_csv(data_path + '/newrawdata.csv', index=False)
-    print(nf_list[:30])
-    print('\nfinished.')
+    df = pd.read_csv(csv_path)
+
+    # Collect all commits first
+    all_commits = []
+    for _, row in df.iterrows():
+        try:
+            commits = json.loads(row["commit_ids"])
+            all_commits.extend(commits)
+        except:
+            continue
+
+    total_expected = len(all_commits)
+    print(f"\nTotal commits to process: {total_expected}\n")
+
+    miner = GitMiner(owner="apache", repo=REPO, max_workers=4)
+
+    dataset = {}
+    processed = 0
+    skipped = 0
+    last_rate_limit_reset = 0
+
+    output_path = os.path.join(REPO_DATA_PATH, f"{REPO}_source_dataset.json")
+    
+    # Resume logic - load existing progress
+    if os.path.exists(output_path):
+        print("Existing dataset found. Loading for resume...")
+        with open(output_path, "r") as f:
+            dataset = json.load(f)
+        print(f"Already processed commits: {len(dataset)}\n")
+
+    for _, row in df.iterrows():
+        pr_number = row["pr_number"]
+
+        try:
+            commit_ids = json.loads(row["commit_ids"])
+        except:
+            print("Invalid commit_ids format for PR:", pr_number)
+            continue
+
+        for commit_sha in commit_ids:
+            if commit_sha in dataset:
+                continue
+            
+            processed += 1
+            print(f"[{processed}/{total_expected}] Processing {commit_sha[:8]}...", end=" ")
+
+            file_data = miner.get_before_after_content(commit_sha)
+
+            if file_data is None:
+                skipped += 1
+                print("⊘ SKIP")
+            else:
+                dataset[commit_sha] = {
+                    "pr_number": pr_number,
+                    "files": file_data
+                }
+                print(f"✓ ({len(file_data)} files)")
+
+            # Smart checkpointing: save every 50 commits instead of 100
+            if processed % 50 == 0:
+                print(f"  → Saving checkpoint ({len(dataset)} total)...")
+                with open(output_path, "w") as f:
+                    json.dump(dataset, f)
+                print(f"  → Checkpoint saved\n")
+
+                # Smart rate limit handling: check headers and only sleep if needed
+                time.sleep(0.1)  # Small delay instead of 0.2 per commit
+
+    # Final save
+    with open(output_path, "w") as f:
+        json.dump(dataset, f)
+
+    print("\n" + "=" * 60)
+    print("Finished processing")
+    print(f"Total commits expected: {total_expected}")
+    print(f"Total processed: {processed}")
+    print(f"Successful commits: {len(dataset)}")
+    print(f"Skipped commits: {skipped}")
+    print(f"Dataset saved to: {output_path}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
-    # get_source_codes()
-    get_project_name('jitline_diff.csv')
+    build_dataset_from_pr_csv()

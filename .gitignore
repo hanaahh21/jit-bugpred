@@ -27,3 +27,11 @@ logs
 repos
 data/**
 **/.DS_Store
+
+# Repo data - large files
+Repo data/*.csv
+Repo data/*.json
+Repo data/kafka_repo/
+Repo data/src/
+Repo data/src_temp/
+Repo Data
