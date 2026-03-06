@@ -13,7 +13,14 @@ except ImportError:
     differential_evolution = None
 from sklearn import metrics
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import roc_auc_score, precision_recall_curve
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 import pandas as pd
 from metrics import roc_auc
 import matplotlib.pyplot as plt
@@ -36,7 +43,20 @@ def time_since(since):
 
 
 def evaluate(label, output):
-    return roc_auc(np.array(label), np.array(output))
+    y_true = np.array(label)
+    y_score = np.array(output)
+    fpr, tpr, thresholds, auc = roc_auc(y_true, y_score)
+    y_pred = (y_score >= 0.5).astype(int)
+    return {
+        'fpr': fpr,
+        'tpr': tpr,
+        'thresholds': thresholds,
+        'auc': auc,
+        'accuracy': accuracy_score(y_true, y_pred),
+        'precision': precision_score(y_true, y_pred, zero_division=0),
+        'recall': recall_score(y_true, y_pred, zero_division=0),
+        'f1': f1_score(y_true, y_pred, zero_division=0),
+    }
 
 
 def pretrain(model, optimizer, criterion, epochs, dataset, so_far=0, resume=None, output_dir=None):
@@ -46,14 +66,14 @@ def pretrain(model, optimizer, criterion, epochs, dataset, so_far=0, resume=None
     os.makedirs(model_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
     if resume:
-        all_training_aucs = resume['all_training_aucs']
+        all_training_f1s = resume['all_training_f1s']
         all_training_losses = resume['all_training_losses']
-        all_val_aucs = resume['all_val_aucs']
+        all_val_f1s = resume['all_val_f1s']
         all_val_losses = resume['all_val_losses']
     else:
-        all_training_aucs = []
+        all_training_f1s = []
         all_training_losses = []
-        all_val_aucs = []
+        all_val_f1s = []
         all_val_losses = []
 
     # display_every = len(train_dataset) // 100
@@ -110,12 +130,20 @@ def pretrain(model, optimizer, criterion, epochs, dataset, so_far=0, resume=None
         print('* checkpoint saved.')
 
         training_loss = total_loss / len(dataset)
-        _, _, _, training_auc = evaluate(y_true, y_scores)
+        train_metrics = evaluate(y_true, y_scores)
         print('\n<==== training loss = {:.4f} ====>'.format(training_loss))
-        print('metrics: AUC={}'.format(training_auc))
+        print(
+            'metrics: AUC={:.4f}, ACC={:.4f}, PREC={:.4f}, REC={:.4f}, F1={:.4f}'.format(
+                train_metrics['auc'],
+                train_metrics['accuracy'],
+                train_metrics['precision'],
+                train_metrics['recall'],
+                train_metrics['f1'],
+            )
+        )
 
         all_training_losses.append(training_loss)
-        all_training_aucs.append(training_auc)
+        all_training_f1s.append(train_metrics['f1'])
 
         # validation
         total_loss = 0
@@ -144,13 +172,21 @@ def pretrain(model, optimizer, criterion, epochs, dataset, so_far=0, resume=None
                 y_true.append(label)
 
         val_loss = total_loss / len(dataset)
-        _, _, _, val_auc = evaluate(y_true, y_scores)
+        val_metrics = evaluate(y_true, y_scores)
         print('<==== validation loss = {:.4f} ====>'.format(val_loss))
-        print('metrics: AUC={}\n'.format(val_auc))
+        print(
+            'metrics: AUC={:.4f}, ACC={:.4f}, PREC={:.4f}, REC={:.4f}, F1={:.4f}\n'.format(
+                val_metrics['auc'],
+                val_metrics['accuracy'],
+                val_metrics['precision'],
+                val_metrics['recall'],
+                val_metrics['f1'],
+            )
+        )
 
-        if len(all_val_aucs) == 0 or val_auc > max(all_val_aucs):
-            torch.save(model, os.path.join(model_dir, 'model_best_auc.pt'))
-            print('* model_best_auc saved.')
+        if len(all_val_f1s) == 0 or val_metrics['f1'] > max(all_val_f1s):
+            torch.save(model, os.path.join(model_dir, 'model_best_f1.pt'))
+            print('* model_best_f1 saved.')
             if len(train_embeddings):
                 feat_df = pd.DataFrame(np.array(train_embeddings), columns=[f'feat_{i}' for i in range(len(train_embeddings[0]))])
                 feat_df.insert(0, 'label', train_labels)
@@ -162,13 +198,13 @@ def pretrain(model, optimizer, criterion, epochs, dataset, so_far=0, resume=None
             print('* model_least_loss saved.')
 
         all_val_losses.append(val_loss)
-        all_val_aucs.append(val_auc)
+        all_val_f1s.append(val_metrics['f1'])
 
         torch.save({
             'all_training_losses': all_training_losses,
-            'all_training_aucs': all_training_aucs,
+            'all_training_f1s': all_training_f1s,
             'all_val_losses': all_val_losses,
-            'all_val_aucs': all_val_aucs,
+            'all_val_f1s': all_val_f1s,
         }, os.path.join(model_dir, 'stats.pt'))
         print('* stats saved.\n')
 
@@ -204,8 +240,16 @@ def train(clf, train_features, train_labels):
     train_features, train_labels = smote.fit_resample(train_features, train_labels)
     clf.fit(train_features, train_labels)
     prob = clf.predict_proba(valid_features)[:, 1]
-    _, _, _, auc = evaluate(valid_labels, prob)
-    print('metrics: AUC={}\n'.format(auc))
+    valid_metrics = evaluate(valid_labels, prob)
+    print(
+        'metrics: AUC={:.4f}, ACC={:.4f}, PREC={:.4f}, REC={:.4f}, F1={:.4f}\n'.format(
+            valid_metrics['auc'],
+            valid_metrics['accuracy'],
+            valid_metrics['precision'],
+            valid_metrics['recall'],
+            valid_metrics['f1'],
+        )
+    )
 
 
 def test(model, dataset, clf, output_dir=None):
@@ -242,8 +286,21 @@ def test(model, dataset, clf, output_dir=None):
         emb_df = pd.DataFrame(np.array(embeddings), columns=[f'feat_{i}' for i in range(len(embeddings[0]))])
         emb_df.insert(0, 'commit_id', commit_ids)
         emb_df.to_csv(os.path.join(output_dir, 'kafka_test_embeddings.csv'), index=False)
-    fpr, tpr, thresholds, auc = evaluate(y_true, y_scores)
-    print('metrics: AUC={}\n\nthresholds={}\n'.format(auc, str(thresholds)))
+    test_metrics = evaluate(y_true, y_scores)
+    fpr = test_metrics['fpr']
+    tpr = test_metrics['tpr']
+    thresholds = test_metrics['thresholds']
+    auc = test_metrics['auc']
+    print(
+        'metrics: AUC={:.4f}, ACC={:.4f}, PREC={:.4f}, REC={:.4f}, F1={:.4f}\n\nthresholds={}\n'.format(
+            test_metrics['auc'],
+            test_metrics['accuracy'],
+            test_metrics['precision'],
+            test_metrics['recall'],
+            test_metrics['f1'],
+            str(thresholds),
+        )
+    )
     # features = torch.vstack(features_list).cpu().detach().numpy()
     # labels = torch.Tensor(label_list).cpu().detach().numpy()
     # fpr, tpr, thresholds, auc = evaluate(labels, clf.predict_proba(features)[:, 1])
@@ -284,18 +341,18 @@ def resume_training(checkpoint, stats, model, optimizer, criterion, epochs, data
     so_far = checkpoint['epoch']
     resume = {
         'all_training_losses': stats['all_training_losses'],
-        'all_training_aucs': stats['all_training_aucs'],
+        'all_training_f1s': stats.get('all_training_f1s', stats.get('all_training_aucs', [])),
         'all_val_losses': stats['all_val_losses'],
-        'all_val_aucs': stats['all_val_aucs']
+        'all_val_f1s': stats.get('all_val_f1s', stats.get('all_val_aucs', [])),
     }
     print('all set ...')
     pretrain(model, optimizer, criterion, epochs, dataset, so_far, resume)
 
 
 def plot_training(stats):
-    all_training_aucs = stats['all_training_aucs']
+    all_training_f1s = stats.get('all_training_f1s', stats.get('all_training_aucs', []))
     all_training_losses = stats['all_training_losses']
-    all_val_aucs = stats['all_val_aucs']
+    all_val_f1s = stats.get('all_val_f1s', stats.get('all_val_aucs', []))
     all_val_losses = stats['all_val_losses']
 
     plt.figure()
@@ -308,12 +365,12 @@ def plot_training(stats):
     plt.savefig(os.path.join(BASE_PATH, 'trained_models/loss.png'))
 
     plt.figure()
-    plt.plot(all_training_aucs)
-    plt.plot(all_val_aucs)
+    plt.plot(all_training_f1s)
+    plt.plot(all_val_f1s)
     plt.title('Performance')
-    plt.ylabel('AUC')
+    plt.ylabel('F1')
     plt.xlabel('Epochs')
-    plt.legend(['training auc', 'validation auc'], loc='lower right')
+    plt.legend(['training f1', 'validation f1'], loc='lower right')
     plt.savefig(os.path.join(BASE_PATH, 'trained_models/performance.png'))
 
 

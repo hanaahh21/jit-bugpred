@@ -1,7 +1,7 @@
 import json
 import os
 import pickle
-from typing import Dict
+from typing import Dict, List, Optional
 
 import pandas as pd
 import numpy as np
@@ -258,55 +258,183 @@ class ASTDataset(Dataset):
         return training_data
 
 
-if __name__ == "__main__":
-    # ast_dataset = ASTDataset(data_path + '/asts_300_synerr.json')
-    # print(ast_dataset[0])
-    # train_loader = DataLoader(ast_dataset, batch_size=1, shuffle=False)
-    # train_iter = iter(train_loader)
-    # data = train_iter.next()
-    print()
+PR_COMMITS_ROOT = os.path.join(BASE_PATH, 'pr_commit_data', 'repo')
+AST_SUBTREES_ROOT = os.path.join(BASE_PATH, 'ast_subtrees')
+DEFAULT_REPOS = ['kafka', 'flink', 'hadoop', 'hbase', 'beam', 'camel', 'hibernate', 'wildfly']
+DEFAULT_SPLITS = ['train', 'val', 'test']
 
 
-def prepare_kafka_pr_splits(
-        commits_csv=os.path.join(repo_data_path, 'kafka_commits.csv'),
-        test_set_csv=os.path.join(repo_data_path, 'kafka_test_set.csv'),
-        val_set_csv=os.path.join(repo_data_path, 'kafka_val_set.csv'),
-        ast_file=os.path.join(repo_data_path, 'kafka_ast_subtrees.json'),
-        output_dir=os.path.join(repo_data_path, 'kafka')):
+def _normalize_repo_name(repo: str) -> str:
+    repo = repo.strip().lower()
+    if repo == 'wildlfy':
+        return 'wildfly'
+    return repo
+
+
+def _parse_int(value) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_commits_cell(raw: str) -> List[str]:
+    if raw is None:
+        return []
+    text = str(raw).strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return [text]
+    if isinstance(parsed, list):
+        return [str(c).strip() for c in parsed if str(c).strip()]
+    if isinstance(parsed, str):
+        return [parsed.strip()] if parsed.strip() else []
+    return []
+
+
+def _resolve_ast_file(repo: str, split: str) -> str:
+    primary = os.path.join(AST_SUBTREES_ROOT, repo, f'{split}_astsub.json')
+    if os.path.exists(primary):
+        return primary
+    backup = primary + '.bak'
+    if os.path.exists(backup):
+        return backup
+    raise FileNotFoundError(f"Missing AST file for repo='{repo}', split='{split}': {primary}")
+
+
+def _load_pr_commit_rows(repo: str, split: str) -> pd.DataFrame:
+    csv_path = os.path.join(PR_COMMITS_ROOT, repo, f'{split}.csv')
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Missing PR commit CSV: {csv_path}")
+    df = pd.read_csv(csv_path)
+    required = {'pr_number', 'commits', 'label'}
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"{csv_path} missing required columns: {missing}")
+    return df
+
+
+def _collect_split_rows_and_ast_files(repos: List[str], splits: List[str]) -> (pd.DataFrame, List[str]):
+    rows = []
+    ast_files = []
+    split_dfs = []
+    for repo in repos:
+        repo = _normalize_repo_name(repo)
+        for split in splits:
+            split_dfs.append(_load_pr_commit_rows(repo, split))
+            ast_path = _resolve_ast_file(repo, split)
+            ast_files.append(ast_path)
+
+    # Collect all commit ids that actually have ASTs for this output split.
+    ast_commit_ids = set()
+    for ast_path in ast_files:
+        with open(ast_path, 'r', encoding='utf-8') as fp:
+            ast_data = json.load(fp)
+        ast_commit_ids.update(str(cid) for cid in ast_data.keys())
+
+    # Keep only commit ids that are present in AST files.
+    for df in split_dfs:
+        for _, row in df.iterrows():
+            pr = _parse_int(row.get('pr_number'))
+            label = _parse_int(row.get('label'))
+            commits = _parse_commits_cell(row.get('commits'))
+            for commit_id in commits:
+                commit_id = str(commit_id)
+                if commit_id not in ast_commit_ids:
+                    continue
+                rows.append(
+                    {
+                        'commit_id': commit_id,
+                        'pr_id': pr if pr is not None else -1,
+                        'label': label if label in (0, 1) else -1,
+                    }
+                )
+    out_df = pd.DataFrame(rows, columns=['commit_id', 'pr_id', 'label'])
+    if not out_df.empty:
+        out_df = out_df.drop_duplicates(subset=['commit_id'], keep='first')
+    # preserve order, remove duplicates
+    dedup_ast = list(dict.fromkeys(ast_files))
+    return out_df, dedup_ast
+
+
+def prepare_pr_whole_splits(setup: int = 1, output_dir: Optional[str] = None):
+    if setup not in (1, 2):
+        raise ValueError('--setup must be 1 or 2')
+
+    output_dir = output_dir or os.path.join(BASE_PATH, 'ast_embeddings', f'setup{setup}')
     os.makedirs(output_dir, exist_ok=True)
 
-    with open(ast_file, 'r') as fp:
-        ast_dict = json.load(fp)
-    ast_commit_ids = set(str(commit_id) for commit_id in ast_dict.keys())
+    if setup == 1:
+        split_spec = {
+            'train': {'repos': DEFAULT_REPOS, 'splits': ['train']},
+            'val': {'repos': DEFAULT_REPOS, 'splits': ['val']},
+            'test': {'repos': DEFAULT_REPOS, 'splits': ['test']},
+        }
+    else:
+        split_spec = {
+            'train': {'repos': ['kafka', 'flink', 'hadoop', 'hbase', 'beam'], 'splits': DEFAULT_SPLITS},
+            'val': {'repos': ['camel'], 'splits': DEFAULT_SPLITS},
+            'test': {'repos': ['hibernate', 'wildlfy'], 'splits': DEFAULT_SPLITS},
+        }
 
-    commits_df = pd.read_csv(commits_csv)
-    commits_df['commit_id'] = commits_df['commit_id'].astype(str)
-    commits_df = commits_df[commits_df['commit_id'].isin(ast_commit_ids)].copy()
+    commit_lists = {}
+    ast_data_dict = {}
+    merged_frames = []
 
-    test_prs = set(pd.read_csv(test_set_csv)['pr_number'].astype(int).tolist())
-    val_prs = set(pd.read_csv(val_set_csv)['pr_number'].astype(int).tolist())
+    for out_split in ['train', 'val', 'test']:
+        spec = split_spec[out_split]
+        split_df, split_ast_files = _collect_split_rows_and_ast_files(
+            repos=spec['repos'],
+            splits=spec['splits'],
+        )
+        split_csv = os.path.join(output_dir, f'{out_split}_whole.csv')
+        split_df.to_csv(split_csv, index=False)
+        commit_lists[out_split] = split_csv
+        ast_data_dict[out_split] = split_ast_files
+        merged_frames.append(split_df)
+        print(f"[setup {setup}] {out_split}_whole: commits={len(split_df)}, ast_files={len(split_ast_files)}")
 
-    test_df = commits_df[commits_df['pr_id'].isin(test_prs)].copy()
-    val_df = commits_df[commits_df['pr_id'].isin(val_prs)].copy()
-    train_df = commits_df[~commits_df['pr_id'].isin(test_prs.union(val_prs))].copy()
+    labels_df = pd.concat(merged_frames, ignore_index=True)
+    if not labels_df.empty:
+        labels_df = labels_df[['commit_id', 'label']].drop_duplicates(subset=['commit_id'], keep='first')
+    else:
+        labels_df = pd.DataFrame(columns=['commit_id', 'label'])
+    labels_path = os.path.join(output_dir, 'labels_whole.csv')
+    labels_df.to_csv(labels_path, index=False)
 
-    train_file = os.path.join(output_dir, 'kafka_train_commits.csv')
-    val_file = os.path.join(output_dir, 'kafka_val_commits.csv')
-    test_file = os.path.join(output_dir, 'kafka_test_commits.csv')
-
-    train_df[['commit_id', 'pr_id', 'label']].to_csv(train_file, index=False)
-    val_df[['commit_id', 'pr_id', 'label']].to_csv(val_file, index=False)
-    test_df[['commit_id', 'pr_id', 'label']].to_csv(test_file, index=False)
-
-    labels_file = os.path.join(output_dir, 'kafka_labels.csv')
-    commits_df[['commit_id', 'label']].to_csv(labels_file, index=False)
-
-    print('Kafka split from AST-backed commits only: {}'.format(len(commits_df)))
-    print('Train/Val/Test commits: {}/{}/{}'.format(len(train_df), len(val_df), len(test_df)))
-
-    return {
-        'train': train_file,
-        'val': val_file,
-        'test': test_file,
-        'labels': labels_file,
+    data_dict = {
+        'train': ast_data_dict['train'],
+        'val': ast_data_dict['val'],
+        'test': ast_data_dict['test'],
+        'labels': labels_path,
     }
+
+    print(f"[setup {setup}] labels_whole: {len(labels_df)} commits")
+    return {
+        'train': commit_lists['train'],
+        'val': commit_lists['val'],
+        'test': commit_lists['test'],
+        'labels': labels_path,
+        'data_dict': data_dict,
+        'commit_lists': commit_lists,
+    }
+
+
+# Backward compatible alias used by main.py / predict.py imports.
+def prepare_kafka_pr_splits(output_dir=None, setup: int = 1):
+    return prepare_pr_whole_splits(setup=setup, output_dir=output_dir)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Prepare whole split CSVs for ASTDataset from pr_commit_data.')
+    parser.add_argument('--setup', type=int, choices=[1, 2], required=True)
+    parser.add_argument('--output-dir', default=None)
+    args = parser.parse_args()
+    prepare_pr_whole_splits(setup=args.setup, output_dir=args.output_dir)

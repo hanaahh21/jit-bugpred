@@ -13,47 +13,21 @@ BASE_PATH = os.path.dirname(os.path.dirname(__file__))
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--test", action="store_true")
-    parser.add_argument("--dataset", choices=['apache', 'kafka'], default='kafka')
     parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--setup", type=int, choices=[1, 2], default=1)
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
     epochs = args.epochs
     batch_size = 1
     n_classes = 2
 
-    if args.dataset == 'kafka':
-        kafka_output_dir = os.path.join(BASE_PATH, 'Repo data', 'kafka')
-        os.makedirs(kafka_output_dir, exist_ok=True)
-        split_files = prepare_kafka_pr_splits(output_dir=kafka_output_dir)
-        data_dict = {
-            'train': ['/Repo data/kafka_ast_subtrees.json'],
-            'val': ['/Repo data/kafka_ast_subtrees.json'],
-            'test': ['/Repo data/kafka_ast_subtrees.json'],
-            'labels': '/Repo data/kafka/kafka_labels.csv'
-        }
-        commit_lists = {
-            'train': split_files['train'],
-            'val': split_files['val'],
-            'test': split_files['test']
-        }
-        metrics_file = None
-        output_dir = kafka_output_dir
-    else:
-        data_dict = {
-            'train': ['/apache_train_50_all_1.json', '/apache_train_50_all_2.json',
-                      '/apache_train_50_all_3.json', '/apache_train_50_all_4.json'],
-            'val': ['/apache_valid_50_all.json'],
-            'test': ['/apache_test.json'],
-            'labels': '/apache_labels.json'
-        }
-        commit_lists = {
-            'train': '/apache_train_50_all.csv',
-            'val': '/apache_valid_50_all.csv',
-            'test': '/apache_test.csv'
-        }
-        metrics_file = 'apache_metrics_kamei.csv'
-        output_dir = os.path.join(BASE_PATH, 'data')
-        os.makedirs(output_dir, exist_ok=True)
+    output_dir = os.path.join(BASE_PATH, 'ast_embeddings', f'setup{args.setup}')
+    os.makedirs(output_dir, exist_ok=True)
+    split_files = prepare_kafka_pr_splits(output_dir=output_dir, setup=args.setup)
+    data_dict = split_files['data_dict']
+    commit_lists = split_files['commit_lists']
+    metrics_file = None
 
     os.makedirs(os.path.join(BASE_PATH, 'trained_models'), exist_ok=True)
 
@@ -67,8 +41,26 @@ if __name__ == '__main__':
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters())
 
-    # training
-    pretrain(model, optimizer, criterion, epochs, dataset, output_dir=output_dir)
+    # training (fresh or resumed)
+    if args.resume:
+        checkpoint_path = os.path.join(BASE_PATH, 'trained_models', 'checkpoint.pt')
+        stats_path = os.path.join(BASE_PATH, 'trained_models', 'stats.pt')
+        if os.path.exists(checkpoint_path) and os.path.exists(stats_path):
+            print(f"Resuming from checkpoint: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            saved_stats = torch.load(stats_path, map_location='cpu')
+            done_epochs = int(checkpoint.get('epoch', 0))
+            remaining_epochs = max(0, epochs - done_epochs)
+            if remaining_epochs == 0:
+                print(f"Checkpoint already at epoch {done_epochs}, target epochs={epochs}. Nothing to train.")
+            else:
+                print(f"Continuing from epoch {done_epochs} to target epoch {epochs} ({remaining_epochs} epochs remaining).")
+                resume_training(checkpoint, saved_stats, model, optimizer, criterion, remaining_epochs, dataset)
+        else:
+            print('Resume requested but checkpoint/stats not found. Starting fresh training.')
+            pretrain(model, optimizer, criterion, epochs, dataset, output_dir=output_dir)
+    else:
+        pretrain(model, optimizer, criterion, epochs, dataset, output_dir=output_dir)
     # train_features = torch.load(os.path.join(BASE_PATH, 'trained_models/train_features.pt')).cpu().detach().numpy()
     # train_labels = torch.load(os.path.join(BASE_PATH, 'trained_models/train_labels.pt')).cpu().detach().numpy()
     clf = RandomForestClassifier(n_estimators=300, random_state=42, n_jobs=-1)
@@ -89,5 +81,9 @@ if __name__ == '__main__':
 
     if args.test:
         # need map_location=torch.device('cpu') if on CPU
-        model = torch.load(os.path.join(BASE_PATH, 'trained_models/model_best_auc.pt'))
+        model = torch.load(
+            os.path.join(BASE_PATH, 'trained_models/model_best_f1.pt'),
+            map_location='cpu',
+            weights_only=False,
+        )
         test(model, dataset, clf, output_dir=output_dir)

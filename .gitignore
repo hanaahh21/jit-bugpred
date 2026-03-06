@@ -35,5 +35,8 @@ Repo data/kafka_repo/
 Repo data/src/
 Repo data/src_temp/
 Repo Data
-
+pr_commit_data
+ast_subtrees
+checkpoints_source_files
+ast_embeddings
 .venv/
